@@ -1,0 +1,19 @@
+{
+  "name": "stk-shoot-to-kill",
+  "version": "1.0.0",
+  "private": true,
+  "description": "STK Shoot To Kill recruitment and Discord onboarding website",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "connect-sqlite3": "^0.9.18",
+    "dotenv": "^18.0.7",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.1",
+    "express-session": "^1.19.0",
+    "helmet": "^8.3.0"
+  }
+}
