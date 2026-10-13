@@ -3,8 +3,8 @@ require("dotenv").config();
 
 const express = require("express");
 const session = require("express-session");
-const SQLiteStore = require("connect-sqlite3")(session);
-const Database = require("better-sqlite3");
+const PgSession = require("connect-pg-simple")(session);
+const { Pool } = require("pg");
 const helmet = require("helmet");
 const { rateLimit } = require("express-rate-limit");
 const crypto = require("node:crypto");
@@ -14,6 +14,18 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const isProduction = process.env.NODE_ENV === "production";
 
+if (!process.env.DATABASE_URL) {
+  console.error("Missing DATABASE_URL environment variable.");
+  process.exit(1);
+}
+
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
 const requiredSettings = [
   "SESSION_SECRET",
   "DISCORD_CLIENT_ID",
@@ -56,16 +68,18 @@ app.use(express.urlencoded({ extended: false, limit: "20kb" }));
 // SERVER-SIDE SESSIONS
 // --------------------------------------------------
 
+const sessionStore = new PgSession({
+  pool,
+  createTableIfMissing: true,
+});
+
 app.use(
   session({
     name: "stk.sid",
     secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    store: new SQLiteStore({
-      db: "sessions.db",
-dir: DATA_DIR,
-    }),
+    store: sessionStore,
     cookie: {
       httpOnly: true,
       sameSite: "lax",
@@ -74,7 +88,6 @@ dir: DATA_DIR,
     },
   })
 );
-
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 30,
@@ -88,43 +101,32 @@ app.use("/api", limiter);
 // APPLICATION DATABASE
 // --------------------------------------------------
 
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
-fs.mkdirSync(DATA_DIR, { recursive: true });
-const db = new Database(path.join(DATA_DIR, "stk.db"));
 
-db.pragma("journal_mode = WAL");
+async function initializeDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS applications (
+      id BIGSERIAL PRIMARY KEY,
+      discord_id TEXT NOT NULL,
+      username TEXT NOT NULL,
+      platform TEXT NOT NULL,
+      timezone TEXT NOT NULL DEFAULT '',
+      age TEXT NOT NULL,
+      experience TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      reviewer_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS applications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    discord_id TEXT NOT NULL,
-    username TEXT NOT NULL,
-    platform TEXT NOT NULL,
-    timezone TEXT NOT NULL DEFAULT '',
-    age TEXT NOT NULL,
-    experience TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    reviewer_id TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS applications_status_idx
+    ON applications(status)
+  `);
 
-  CREATE INDEX IF NOT EXISTS applications_status_idx
-  ON applications(status);
-
-  CREATE INDEX IF NOT EXISTS applications_discord_idx
-  ON applications(discord_id);
-`);
-
-// Add the timezone column to an older database if necessary.
-const applicationColumns = db
-  .prepare("PRAGMA table_info(applications)")
-  .all();
-
-if (!applicationColumns.some((column) => column.name === "timezone")) {
-  db.exec(`
-    ALTER TABLE applications
-    ADD COLUMN timezone TEXT NOT NULL DEFAULT ''
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS applications_discord_idx
+    ON applications(discord_id)
   `);
 }
 
@@ -417,6 +419,7 @@ app.get("/api/config", (req, res) => {
 // SUBMIT AN APPLICATION
 // --------------------------------------------------
 
+
 app.post(
   "/api/applications",
   requireLogin,
@@ -459,13 +462,16 @@ app.post(
         });
       }
 
-      const existing = db.prepare(`
-        SELECT id, status
-        FROM applications
-        WHERE discord_id = ?
-        ORDER BY id DESC
-        LIMIT 1
-      `).get(req.session.user.id);
+      const existingResult = await pool.query(
+        `SELECT id, status
+         FROM applications
+         WHERE discord_id = $1
+         ORDER BY id DESC
+         LIMIT 1`,
+        [req.session.user.id]
+      );
+
+      const existing = existingResult.rows[0];
 
       if (existing && existing.status !== "rejected") {
         return res.status(409).json({
@@ -473,18 +479,20 @@ app.post(
         });
       }
 
-      const result = db.prepare(`
-        INSERT INTO applications
+      const insertResult = await pool.query(
+        `INSERT INTO applications
           (discord_id, username, platform, timezone, age, experience, reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        req.session.user.id,
-        req.session.user.username,
-        platform,
-        timezone,
-        age,
-        experience,
-        reason
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id`,
+        [
+          req.session.user.id,
+          req.session.user.username,
+          platform,
+          timezone,
+          age,
+          experience,
+          reason,
+        ]
       );
 
       const recruitOK = await trySetRole(
@@ -508,7 +516,7 @@ app.post(
         message: rolesOK
           ? "Application submitted! Your application is awaiting staff approval."
           : "Application saved, but a Discord role could not be assigned. Please contact staff.",
-        id: Number(result.lastInsertRowid),
+        id: Number(insertResult.rows[0].id),
       });
     } catch (error) {
       console.error("Application submission failed:", error.message);
@@ -524,45 +532,61 @@ app.post(
 // VIEW YOUR OWN APPLICATION
 // --------------------------------------------------
 
-app.get("/api/my-application", requireLogin, (req, res) => {
-  const application = db.prepare(`
-    SELECT id, username, platform, timezone, status, created_at
-    FROM applications
-    WHERE discord_id = ?
-    ORDER BY id DESC
-    LIMIT 1
-  `).get(req.session.user.id);
 
-  res.json({ application: application || null });
+app.get("/api/my-application", requireLogin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, username, platform, timezone, status, created_at
+       FROM applications
+       WHERE discord_id = $1
+       ORDER BY id DESC
+       LIMIT 1`,
+      [req.session.user.id]
+    );
+
+    res.json({ application: result.rows[0] || null });
+  } catch (error) {
+    console.error("Loading application failed:", error.message);
+    res.status(500).json({ error: "Could not load your application." });
+  }
 });
 
 // --------------------------------------------------
 // STAFF APPLICATION LIST
 // --------------------------------------------------
 
+
 app.get(
   "/api/staff/applications",
   requireLogin,
   requireStaff,
-  (req, res) => {
-    const applications = db.prepare(`
-      SELECT
-        id, discord_id, username, platform, timezone,
-        age, experience, reason, status, created_at
-      FROM applications
-      ORDER BY
-        CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
-        id DESC
-      LIMIT 200
-    `).all();
+  async (req, res) => {
+    try {
+      const result = await pool.query(`
+        SELECT
+          id, discord_id, username, platform, timezone,
+          age, experience, reason, status, created_at
+        FROM applications
+        ORDER BY
+          CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
+          id DESC
+        LIMIT 200
+      `);
 
-    res.json({ applications });
+      res.json({ applications: result.rows });
+    } catch (error) {
+      console.error("Loading staff applications failed:", error.message);
+      res.status(500).json({
+        error: "Could not load staff applications.",
+      });
+    }
   }
 );
 
 // --------------------------------------------------
 // STAFF APPROVAL AND REJECTION
 // --------------------------------------------------
+
 
 app.post(
   "/api/staff/applications/:id/review",
@@ -585,23 +609,26 @@ app.post(
       });
     }
 
-    const application = db.prepare(`
-      SELECT * FROM applications WHERE id = ?
-    `).get(id);
-
-    if (!application) {
-      return res.status(404).json({
-        error: "Application not found.",
-      });
-    }
-
-    if (application.status !== "pending") {
-      return res.status(409).json({
-        error: "This application has already been reviewed.",
-      });
-    }
-
     try {
+      const found = await pool.query(
+        "SELECT * FROM applications WHERE id = $1",
+        [id]
+      );
+
+      const application = found.rows[0];
+
+      if (!application) {
+        return res.status(404).json({
+          error: "Application not found.",
+        });
+      }
+
+      if (application.status !== "pending") {
+        return res.status(409).json({
+          error: "This application has already been reviewed.",
+        });
+      }
+
       if (decision === "approve") {
         await setRole(
           application.discord_id,
@@ -633,17 +660,19 @@ app.post(
         }
       }
 
-      const updated = db.prepare(`
-        UPDATE applications
-        SET status = ?, reviewer_id = ?
-        WHERE id = ? AND status = 'pending'
-      `).run(
-        decision === "approve" ? "approved" : "rejected",
-        req.session.user.id,
-        id
+      const updated = await pool.query(
+        `UPDATE applications
+         SET status = $1, reviewer_id = $2
+         WHERE id = $3 AND status = 'pending'
+         RETURNING id`,
+        [
+          decision === "approve" ? "approved" : "rejected",
+          req.session.user.id,
+          id,
+        ]
       );
 
-      if (updated.changes !== 1) {
+      if (updated.rowCount !== 1) {
         return res.status(409).json({
           error: "This application was already reviewed.",
         });
@@ -657,7 +686,7 @@ app.post(
       console.error("Staff review failed:", error.message);
 
       res.status(502).json({
-        error: "Discord role update failed. Check bot permissions and confirm the applicant is in the server. The application remains pending.",
+        error: "The review could not be completed. Check the server terminal and verify the application's status and Discord roles before retrying.",
       });
     }
   }
@@ -701,6 +730,14 @@ app.use((req, res) => {
 // START
 // --------------------------------------------------
 
-app.listen(PORT, () => {
-  console.log(`STK website running at http://localhost:${PORT}`);
-});
+
+initializeDatabase()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`STK website running at http://localhost:${PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Database initialization failed:", error.message);
+    process.exit(1);
+  });
